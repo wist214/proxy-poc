@@ -223,7 +223,8 @@ Sitemap: {baseUrl}/sitemap.xml
     <lastmod>{DateModified}</lastmod>
     <changefreq>{changefreq}</changefreq>
     <priority>{priority}</priority>
-  </url>""";
+  </url>
+""";
         }));
 
         return $"""
