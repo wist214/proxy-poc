@@ -54,14 +54,37 @@ app.Use(async (context, next) =>
         context.Response.Headers["X-Served-By"] = "dns-proxy-poc";
         context.Response.Headers["X-Crawler-Detected"] = isCrawler.ToString().ToLowerInvariant();
         context.Response.Headers["Vary"] = "User-Agent";
+        if (isCrawler)
+        {
+            context.Response.Headers["X-Robots-Tag"] = "index, follow";
+            context.Response.Headers["Link"] =
+                "</sitemap.xml>; rel=\"sitemap\", " +
+                "</llms.txt>; rel=\"alternate\"; type=\"text/plain\"; title=\"LLMs.txt\"";
+        }
         return Task.CompletedTask;
     });
 
     await next();
 });
 
-// ── Diagnostic endpoints (/_proxy/ prefix to avoid clashing with target) ──
+// ── Public AI readability files (served to all visitors) ───────────
 string[] getHead = ["GET", "HEAD"];
+
+app.MapMethods("/llms.txt", getHead, async (HttpContext ctx) =>
+{
+    var baseUrl = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
+    ctx.Response.ContentType = "text/plain; charset=utf-8";
+    await ctx.Response.WriteAsync(BotContent.LlmsTxt(baseUrl));
+});
+
+app.MapMethods("/llms-full.txt", getHead, async (HttpContext ctx) =>
+{
+    var baseUrl = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
+    ctx.Response.ContentType = "text/plain; charset=utf-8";
+    await ctx.Response.WriteAsync(BotContent.LlmsFullTxt(baseUrl));
+});
+
+// ── Diagnostic endpoints (/_proxy/ prefix to avoid clashing with target) ──
 
 app.MapMethods("/_proxy/debug", getHead, (HttpContext ctx) =>
 {
@@ -106,7 +129,7 @@ app.Map("{**path}", async (HttpContext ctx, IHttpClientFactory httpClientFactory
         }
 
         // Bots: serve custom HTML for known pages
-        var botHtml = BotContent.GetPage(path);
+        var botHtml = BotContent.GetPage(path, baseUrl);
         if (botHtml is not null)
         {
             ctx.Response.ContentType = "text/html; charset=utf-8";
@@ -180,12 +203,82 @@ static class CrawlerDetector
 {
     private static readonly string[] CrawlerPatterns =
     [
-        "Googlebot", "Bingbot", "Slurp", "DuckDuckBot",
-        "Baiduspider", "YandexBot", "facebookexternalhit", "Twitterbot",
-        "LinkedInBot", "WhatsApp", "TelegramBot", "ChatGPT-User",
-        "GPTBot", "OAI-SearchBot", "ClaudeBot", "Anthropic",
-        "PerplexityBot", "Google-Extended", "CCBot", "Applebot",
-        "AhrefsBot", "Bytespider", "cohere-ai", "Meta-ExternalAgent"
+        // ── Traditional search engines ────────────────────────────────────
+        "Googlebot", "bingbot", "Slurp", "DuckDuckBot",
+        "Baiduspider", "YandexBot", "Qwantify",
+
+        // ── Social / messaging ────────────────────────────────────────────
+        "facebookexternalhit", "Twitterbot", "LinkedInBot",
+        "WhatsApp", "TelegramBot",
+
+        // ── OpenAI (ChatGPT / SearchGPT) ──────────────────────────────────
+        "GPTBot", "ChatGPT-User", "OAI-SearchBot",
+
+        // ── Anthropic (Claude) ────────────────────────────────────────────
+        "ClaudeBot", "Claude-User", "Claude-SearchBot", "Claude-Web", "anthropic-ai", "Anthropic",
+
+        // ── Google AI (Gemini, AI Overviews, Vertex, NotebookLM) ──────────
+        "Google-Extended", "Google-CloudVertexBot", "Google-NotebookLM", "Gemini-Deep-Research",
+
+        // ── Microsoft / Bing (Copilot uses bingbot index) ─────────────────
+        // covered by "bingbot" above
+
+        // ── Meta AI ───────────────────────────────────────────────────────
+        "Meta-ExternalAgent", "meta-externalagent", "meta-webindexer", "Bytespider",
+
+        // ── xAI / Grok ────────────────────────────────────────────────────
+        "xAI", "GrokBot",
+
+        // ── Perplexity ────────────────────────────────────────────────────
+        "PerplexityBot", "Perplexity-User",
+
+        // ── Apple (Spotlight, Siri, Apple Intelligence) ───────────────────
+        "Applebot",                  // matches Applebot and Applebot-Extended
+
+        // ── Amazon (Alexa AI, Kiro) ───────────────────────────────────────
+        "Amazonbot",
+
+        // ── Allen Institute for AI (OLMo, Dolma dataset) ─────────────────
+        "AI2Bot",                    // matches AI2Bot, Ai2Bot-Dolma, Ai2Bot-DeepResearchEval
+
+        // ── Cohere ────────────────────────────────────────────────────────
+        "cohere-ai",
+
+        // ── Diffbot (AI knowledge graph) ──────────────────────────────────
+        "Diffbot",
+
+        // ── DuckDuckGo AI Answers ─────────────────────────────────────────
+        "DuckAssistBot",
+
+        // ── Common Crawl (widely used for LLM training) ───────────────────
+        "CCBot",
+
+        // ── Mistral AI (Le Chat web browsing) ────────────────────────────
+        "MistralAI-User",
+
+        // ── DeepSeek ─────────────────────────────────────────────────────
+        "DeepseekBot",
+
+        // ── You.com AI search ────────────────────────────────────────────
+        "YouBot",
+
+        // ── Brave Search ─────────────────────────────────────────────────
+        "Bravebot",
+
+        // ── Kagi ─────────────────────────────────────────────────────────
+        "kagi-fetcher",
+
+        // ── HuggingFace ──────────────────────────────────────────────────
+        "HuggingFace-Bot",
+
+        // ── Firecrawl / Tavily (AI agent web tools) ──────────────────────
+        "FirecrawlAgent", "TavilyBot",
+
+        // ── SEO tools (signal content quality to AI systems) ─────────────
+        "AhrefsBot", "SemrushBot", "serpstatbot", "DataForSeoBot",
+
+        // ── Other AI crawlers ─────────────────────────────────────────────
+        "magpie-crawler", "Timpibot", "omgili", "iaskspider"
     ];
 
     public static bool IsCrawler(string userAgent)
