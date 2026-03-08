@@ -1,15 +1,36 @@
 using DnsProxyPoc;
 using System.Collections.Concurrent;
+using System.Net.Http.Headers;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// HttpClient for reverse proxying to target site
+builder.Services.AddHttpClient("proxy", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
+}).ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+{
+    AllowAutoRedirect = false,
+    AutomaticDecompression = System.Net.DecompressionMethods.None
+});
+
 var app = builder.Build();
 
-// In-memory visitor log (last 50 requests)
+// ── Proxy target configuration ──────────────────────────────────────
+var proxyTarget = app.Configuration["ProxyTarget"]
+    ?? throw new InvalidOperationException("ProxyTarget is not configured. Set it in appsettings.json.");
+
+if (!Uri.TryCreate(proxyTarget, UriKind.Absolute, out var targetUri) ||
+    (targetUri.Scheme != "https" && targetUri.Scheme != "http"))
+{
+    throw new InvalidOperationException($"Invalid ProxyTarget URL: {proxyTarget}");
+}
+
 var visitorLog = new ConcurrentQueue<object>();
 
 app.UseHttpsRedirection();
 
-// Crawler detection middleware — runs before all routes
+// ── Crawler detection middleware ────────────────────────────────────
 app.Use(async (context, next) =>
 {
     var userAgent = context.Request.Headers.UserAgent.ToString();
@@ -17,7 +38,6 @@ app.Use(async (context, next) =>
 
     context.Items["IsCrawler"] = isCrawler;
 
-    // Log visitor
     visitorLog.Enqueue(new
     {
         time = DateTime.UtcNow.ToString("o"),
@@ -40,70 +60,10 @@ app.Use(async (context, next) =>
     await next();
 });
 
-// ── Routes ───────────────────────────────────────────────────────────
-
+// ── Diagnostic endpoints (/_proxy/ prefix to avoid clashing with target) ──
 string[] getHead = ["GET", "HEAD"];
 
-app.MapMethods("/", getHead, (HttpContext ctx) =>
-{
-    var isCrawler = (bool)ctx.Items["IsCrawler"]!;
-    return Results.Content(ContentPages.HomePage(isCrawler), "text/html");
-});
-
-app.MapMethods("/about", getHead, (HttpContext ctx) =>
-{
-    var isCrawler = (bool)ctx.Items["IsCrawler"]!;
-    return Results.Content(ContentPages.AboutPage(isCrawler), "text/html");
-});
-
-app.MapMethods("/articles/{slug}", getHead, (string slug, HttpContext ctx) =>
-{
-    var isCrawler = (bool)ctx.Items["IsCrawler"]!;
-    var html = ContentPages.ArticlePage(slug, isCrawler);
-    return html is not null
-        ? Results.Content(html, "text/html")
-        : Results.Content(ContentPages.NotFoundPage(isCrawler), "text/html", statusCode: 404);
-});
-
-app.MapMethods("/robots.txt", getHead, (HttpContext ctx) =>
-{
-    var baseUrl = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
-    return Results.Text($"""
-        User-agent: *
-        Allow: /
-
-        User-agent: ChatGPT-User
-        Allow: /
-
-        User-agent: GPTBot
-        Allow: /
-
-        Sitemap: {baseUrl}/sitemap.xml
-        """.Replace("        ", ""), "text/plain");
-});
-
-app.MapMethods("/sitemap.xml", getHead, (HttpContext ctx) =>
-{
-    var baseUrl = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
-    string[] paths = ["/", "/about", "/articles/psychology", "/articles/in-nature", "/articles/history"];
-
-    var urls = string.Join("\n", paths.Select(p => $"""
-          <url>
-            <loc>{baseUrl}{p}</loc>
-          </url>
-        """));
-
-    var xml = $"""
-        <?xml version="1.0" encoding="UTF-8"?>
-        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-        {urls}
-        </urlset>
-        """;
-
-    return Results.Content(xml, "application/xml");
-});
-
-app.MapMethods("/debug", getHead, (HttpContext ctx) =>
+app.MapMethods("/_proxy/debug", getHead, (HttpContext ctx) =>
 {
     var userAgent = ctx.Request.Headers.UserAgent.ToString();
     var isCrawler = (bool)ctx.Items["IsCrawler"]!;
@@ -112,18 +72,109 @@ app.MapMethods("/debug", getHead, (HttpContext ctx) =>
     {
         userAgent,
         isCrawler,
-        theme = isCrawler ? "red" : "blue",
+        proxyTarget,
+        mode = isCrawler ? "bot-content" : "proxy-passthrough",
         ip = ctx.Connection.RemoteIpAddress?.ToString(),
         allHeaders = headers
     });
 });
 
-app.MapMethods("/log", getHead, (HttpContext ctx) =>
+app.MapMethods("/_proxy/log", getHead, () => Results.Json(visitorLog.ToArray()));
+
+// ── Catch-all: bots → custom content, humans → reverse proxy ───────
+app.Map("{**path}", async (HttpContext ctx, IHttpClientFactory httpClientFactory) =>
 {
-    return Results.Json(visitorLog.ToArray());
+    var isCrawler = (bool)ctx.Items["IsCrawler"]!;
+
+    if (isCrawler)
+    {
+        var path = ctx.Request.Path.ToString().ToLowerInvariant().TrimEnd('/');
+        var baseUrl = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
+
+        // Bots: serve custom robots.txt / sitemap.xml
+        if (path == "/robots.txt")
+        {
+            ctx.Response.ContentType = "text/plain";
+            await ctx.Response.WriteAsync(BotContent.RobotsTxt(baseUrl));
+            return;
+        }
+        if (path == "/sitemap.xml")
+        {
+            ctx.Response.ContentType = "application/xml";
+            await ctx.Response.WriteAsync(BotContent.SitemapXml(baseUrl));
+            return;
+        }
+
+        // Bots: serve custom HTML for known pages
+        var botHtml = BotContent.GetPage(path);
+        if (botHtml is not null)
+        {
+            ctx.Response.ContentType = "text/html; charset=utf-8";
+            await ctx.Response.WriteAsync(botHtml);
+            return;
+        }
+
+        // Unknown bot path → fall through to proxy (CSS, JS, images, etc.)
+    }
+
+    // ── Reverse proxy to target site ────────────────────────────────
+    var client = httpClientFactory.CreateClient("proxy");
+    var targetUrl = $"{proxyTarget.TrimEnd('/')}{ctx.Request.Path}{ctx.Request.QueryString}";
+
+    using var proxyReq = new HttpRequestMessage(new HttpMethod(ctx.Request.Method), targetUrl);
+
+    // Forward request headers (skip hop-by-hop)
+    foreach (var header in ctx.Request.Headers)
+    {
+        if (!IsHopByHopHeader(header.Key))
+            proxyReq.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
+    }
+    proxyReq.Headers.Host = targetUri.Host;
+
+    // Forward request body (POST, PUT, PATCH)
+    if (HttpMethods.IsPost(ctx.Request.Method) ||
+        HttpMethods.IsPut(ctx.Request.Method) ||
+        HttpMethods.IsPatch(ctx.Request.Method))
+    {
+        proxyReq.Content = new StreamContent(ctx.Request.Body);
+        if (ctx.Request.ContentType is not null)
+            proxyReq.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(ctx.Request.ContentType);
+    }
+
+    using var proxyResp = await client.SendAsync(proxyReq, HttpCompletionOption.ResponseHeadersRead);
+
+    // Copy response status
+    ctx.Response.StatusCode = (int)proxyResp.StatusCode;
+
+    // Copy response headers
+    foreach (var header in proxyResp.Headers)
+    {
+        if (!IsHopByHopHeader(header.Key))
+            ctx.Response.Headers[header.Key] = header.Value.ToArray();
+    }
+    foreach (var header in proxyResp.Content.Headers)
+    {
+        ctx.Response.Headers[header.Key] = header.Value.ToArray();
+    }
+    ctx.Response.Headers.Remove("transfer-encoding");
+
+    // Stream response body through
+    await proxyResp.Content.CopyToAsync(ctx.Response.Body);
 });
 
 app.Run();
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+static bool IsHopByHopHeader(string name) =>
+    name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+    name.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase) ||
+    name.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) ||
+    name.Equals("TE", StringComparison.OrdinalIgnoreCase) ||
+    name.Equals("Trailer", StringComparison.OrdinalIgnoreCase) ||
+    name.Equals("Upgrade", StringComparison.OrdinalIgnoreCase) ||
+    name.Equals("Proxy-Authorization", StringComparison.OrdinalIgnoreCase) ||
+    name.Equals("Proxy-Authenticate", StringComparison.OrdinalIgnoreCase);
 
 static class CrawlerDetector
 {
