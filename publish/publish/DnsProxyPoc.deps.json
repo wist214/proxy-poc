@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v9.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v9.0": {
+      "DnsProxyPoc/1.0.0": {
+        "runtime": {
+          "DnsProxyPoc.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "DnsProxyPoc/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
